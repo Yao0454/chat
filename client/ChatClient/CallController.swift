@@ -24,6 +24,8 @@ final class CallController {
 
     private(set) var current: Call?
     private(set) var isMuted = false
+    /// 这台电脑上没能开启回声消除，界面上提示戴耳机
+    private(set) var echoCancellationOff = false
 
     /// 正在呼叫、响铃或通话中（已结束、正在显示原因的不算）
     var isBusy: Bool {
@@ -169,6 +171,7 @@ final class CallController {
         do {
             try engine.start()
             self.engine = engine
+            echoCancellationOff = !engine.echoCancellation
         } catch {
             if let id = current?.id {
                 socket?.send(CallCommand(type: "call_hangup", callId: id))
@@ -180,6 +183,7 @@ final class CallController {
     private func stopAudio() {
         engine?.stop()
         engine = nil
+        echoCancellationOff = false
     }
 
     /// 来电时响铃，App 在后台时让 Dock 图标跳动

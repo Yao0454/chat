@@ -43,8 +43,14 @@ struct CallBanner: View {
             Text("正在接通…")
         case .active:
             if let start = call.connectedAt {
-                TimelineView(.periodic(from: start, by: 1)) { context in
-                    Text(Duration.seconds(context.date.timeIntervalSince(start)), format: .time(pattern: .minuteSecond))
+                VStack(alignment: .leading, spacing: 1) {
+                    TimelineView(.periodic(from: start, by: 1)) { context in
+                        Text(Duration.seconds(context.date.timeIntervalSince(start)), format: .time(pattern: .minuteSecond))
+                    }
+                    if store.call.echoCancellationOff {
+                        Text("这台电脑没能开启回声消除，建议戴耳机")
+                            .font(.caption)
+                    }
                 }
             }
         case .ended(let text):

@@ -105,11 +105,14 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
         set { lock.withLock { muted = newValue } }
     }
 
+    /// 是否开启了系统的回声消除。有些设备组合下开不了，这时建议戴耳机
+    private(set) var echoCancellation = false
+
     /// 播放端最多积压这么多采样（300ms）。网络卡顿后数据会一下子涌过来，超出的直接丢掉，免得延迟越来越大
     private static let maxQueuedFrames = AVAudioFrameCount(OpusCodec.sampleRate * 0.3)
 
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private let encoder = OpusCodec()   // 只在采集线程上用
     private let decoder = OpusCodec()   // 只在 playQueue 上用
     private let playQueue = DispatchQueue(label: "VoiceEngine.play")
@@ -122,12 +125,31 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
     private var pending: [Float] = []   // 攒够一帧再编码
 
     func start() throws {
-        let input = engine.inputNode
-        // 系统自带的回声消除和降噪，开外放也不会把对方的声音再传回去
         do {
-            try input.setVoiceProcessingEnabled(true)
+            try startEngine(voiceProcessing: true)
         } catch {
-            print("回声消除开启失败，继续通话: \(error)")
+            // 回声消除会把默认输入、输出设备合成一个设备来用。两者采样率不同
+            // （比如麦克风 48kHz、扬声器 44.1kHz）或者用了虚拟声卡时，可能初始化失败
+            // （错误 -10875）。这时换一个新的引擎，不带回声消除再试一次
+            print("开启回声消除后启动失败，改为不带回声消除: \(error)")
+            teardown()
+            engine = AVAudioEngine()
+            player = AVAudioPlayerNode()
+            try startEngine(voiceProcessing: false)
+        }
+    }
+
+    private func startEngine(voiceProcessing: Bool) throws {
+        let input = engine.inputNode
+        echoCancellation = false
+        if voiceProcessing {
+            // 系统自带的回声消除和降噪，开外放也不会把对方的声音再传回去
+            do {
+                try input.setVoiceProcessingEnabled(true)
+                echoCancellation = true
+            } catch {
+                print("回声消除开启失败，继续通话: \(error)")
+            }
         }
 
         let inputFormat = input.outputFormat(forBus: 0)
@@ -147,6 +169,16 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
         try engine.start()
         player.play()
         lock.withLock { running = true }
+    }
+
+    /// 启动失败后清理，释放回声消除占用的设备
+    private func teardown() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        if echoCancellation {
+            try? engine.inputNode.setVoiceProcessingEnabled(false)
+        }
+        echoCancellation = false
     }
 
     func stop() {
