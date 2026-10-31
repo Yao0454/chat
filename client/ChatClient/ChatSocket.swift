@@ -7,6 +7,8 @@ final class ChatSocket {
     var onConnectionChange: ((Bool) -> Void)?
     /// 握手被服务端以 401 拒绝（token 失效），此时不再重连
     var onUnauthorized: (() -> Void)?
+    /// 收到二进制帧：语音通话里对方的一帧语音
+    var onAudio: ((Data) -> Void)?
 
     private(set) var isConnected = false
 
@@ -47,12 +49,18 @@ final class ChatSocket {
         }
     }
 
+    /// 发送一帧语音。未连接时直接丢弃，语音不需要重发
+    func sendAudio(_ data: Data) {
+        guard isConnected, let task else { return }
+        task.send(.data(data)) { _ in }
+    }
+
     // MARK: - 内部
 
     private func connect() {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let t = URLSession.shared.webSocketTask(with: request)
+        let t = Sessions.session(for: url).webSocketTask(with: request)
         t.maximumMessageSize = 4 * 1024 * 1024 // 一页历史消息可能比较大
         task = t
         t.resume()
@@ -126,7 +134,9 @@ final class ChatSocket {
                 let data: Data
                 switch message {
                 case .string(let s): data = Data(s.utf8)
-                case .data(let d): data = d
+                case .data(let d):
+                    self.onAudio?(d)
+                    continue
                 @unknown default: continue
                 }
 

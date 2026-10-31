@@ -1,11 +1,11 @@
-# 小圈子聊天：第一步（邀请码注册 + 一对一文字聊天）
+# 小圈子聊天：邀请码注册 + 一对一文字聊天 + 语音通话
 
 ```
 chat-app/
 ├── server/            Rust 服务端（axum + SQLite）
 │   ├── Cargo.toml
 │   ├── migrations/0001_init.sql
-│   └── src/  main.rs  api.rs  auth.rs  db.rs  error.rs  hub.rs  ratelimit.rs  ws.rs
+│   └── src/  main.rs  api.rs  auth.rs  calls.rs  db.rs  error.rs  hub.rs  ratelimit.rs  ws.rs
 └── client/
     ├── ChatClient.xcodeproj   Xcode 项目（直接打开）
     ├── Info.plist             允许本地 http 连接
@@ -54,7 +54,20 @@ websocat -H 'Authorization: Bearer TOKEN' ws://127.0.0.1:8080/ws
 
 App 里会立刻出现这条消息；在 App 里回复，websocat 那边也会收到。
 
-## 4. 部署到 VPS
+## 4. 语音通话
+
+在一对一会话里点工具栏的电话按钮发起通话，对方窗口顶部会弹出来电浮条并响铃（App 在后台时 Dock 图标会跳动），可以接听、拒绝；通话中可以静音、挂断。第一次通话时系统会询问麦克风权限。
+
+- 声音经过服务器中转，只要双方都能连上服务器就能通话，不需要额外的 TURN 服务器。
+- 编码用系统自带的 Opus（24 kbps，20ms 一帧），每路通话单向约 25–30 kbps。
+- 开了系统的回声消除，用外放也不会把对方的声音传回去。
+- 同一时间每人只能有一个通话；对方在多台设备上登录时每台都会响铃，哪台接听就用哪台。
+- 响铃 45 秒无人接听自动结束；任何一方掉线，通话随即结束。
+- 语音走 WebSocket（TCP），网络卡顿后积压的语音超过 300ms 会被丢弃，避免延迟越来越大。
+
+测试需要两台 Mac 分别登录两个账号（同一台电脑上 App 只能登录一个账号）。信令协议写在 `server/src/calls.rs` 开头的注释里。
+
+## 5. 部署到 VPS
 
 把 `cargo build --release` 得到的二进制放到服务器上，前面用 Caddy 自动加 HTTPS（WebSocket 会自动转发）：
 

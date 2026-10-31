@@ -15,6 +15,7 @@ final class ChatStore {
     var items: [Int64: [ChatItem]] = [:]
     var isConnected = false
     var errorMessage: String?
+    let call = CallController()
 
     @ObservationIgnored private var api: APIClient?
     @ObservationIgnored private var socket: ChatSocket?
@@ -86,6 +87,8 @@ final class ChatStore {
 
     private func endSession(keepCache: Bool) {
         saveTask?.cancel()
+        call.reset()
+        call.socket = nil
         socket?.stop()
         socket = nil
         Keychain.delete(account: "token")
@@ -128,10 +131,12 @@ final class ChatStore {
         s.onEvent = { [weak self] event in self?.handle(event) }
         s.onConnectionChange = { [weak self] connected in
             self?.isConnected = connected
-            if connected { self?.didConnect() }
+            if connected { self?.didConnect() } else { self?.call.connectionLost() }
         }
         s.onUnauthorized = { [weak self] in self?.sessionExpired() }
+        s.onAudio = { [weak self] packet in self?.call.receiveAudio(packet) }
         socket = s
+        call.socket = s
         s.start()
     }
 
@@ -237,7 +242,14 @@ final class ChatStore {
             advanceSynced(conversationId)
             if hasMore { requestSync(conversationId) }
 
+        case .callIncoming, .callAccepted, .callEnded:
+            call.handle(event)
+            return
+
         case .error(let clientId, let error):
+            if let clientId, call.handleError(callId: clientId, message: error) {
+                return
+            }
             if let clientId {
                 markFailed(clientId: clientId, reason: error)
             } else {

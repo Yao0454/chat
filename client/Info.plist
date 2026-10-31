@@ -2,6 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- macOS 15 起，连接局域网里的其他设备需要用户授权，系统弹窗会显示这句说明 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>连接局域网里的聊天服务器</string>
 	<!-- 本地开发连 http://127.0.0.1；正式部署走 https 时不需要 -->
 	<key>NSAppTransportSecurity</key>
 	<dict>

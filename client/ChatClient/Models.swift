@@ -62,15 +62,31 @@ struct SyncCommand: Encodable {
     let afterSeq: Int64
 }
 
+/// 语音通话：发起
+struct CallInviteCommand: Encodable {
+    let type = "call_invite"
+    let callId: String
+    let conversationId: Int64
+}
+
+/// 语音通话：接听（call_accept）或挂断/拒绝/取消（call_hangup）
+struct CallCommand: Encodable {
+    let type: String
+    let callId: String
+}
+
 enum ServerEvent: Decodable {
     case ack(clientId: String, message: MessageDTO)
     case message(MessageDTO)
     case history(conversationId: Int64, messages: [MessageDTO], hasMore: Bool)
     case error(clientId: String?, error: String)
+    case callIncoming(callId: String, conversationId: Int64, from: UserDTO)
+    case callAccepted(callId: String)
+    case callEnded(callId: String, reason: String)
     case unknown
 
     private enum CodingKeys: String, CodingKey {
-        case type, clientId, message, conversationId, messages, hasMore, error
+        case type, clientId, message, conversationId, messages, hasMore, error, callId, from, reason
     }
 
     init(from decoder: Decoder) throws {
@@ -93,6 +109,19 @@ enum ServerEvent: Decodable {
             self = .error(
                 clientId: try c.decodeIfPresent(String.self, forKey: .clientId),
                 error: try c.decode(String.self, forKey: .error)
+            )
+        case "call_incoming":
+            self = .callIncoming(
+                callId: try c.decode(String.self, forKey: .callId),
+                conversationId: try c.decode(Int64.self, forKey: .conversationId),
+                from: try c.decode(UserDTO.self, forKey: .from)
+            )
+        case "call_accepted":
+            self = .callAccepted(callId: try c.decode(String.self, forKey: .callId))
+        case "call_ended":
+            self = .callEnded(
+                callId: try c.decode(String.self, forKey: .callId),
+                reason: try c.decode(String.self, forKey: .reason)
             )
         default:
             self = .unknown

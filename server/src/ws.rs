@@ -11,6 +11,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::{
     auth::AuthUser,
+    calls,
     db::{self, MessageRow, User},
     AppState,
 };
@@ -26,7 +27,8 @@ const SYNC_PAGE: i64 = 200;
 //   {"type":"ack","client_id":"...","message":{...}}      只发给发送这条消息的连接
 //   {"type":"message","message":{...}}                    发给会话里所有人的所有连接（包括发送者）
 //   {"type":"history","conversation_id":1,"messages":[...],"has_more":false}
-//   {"type":"error","client_id":null,"error":"..."}
+//   {"type":"error","client_id":null,"error":"..."}       client_id 是出错的消息或通话的 id
+// 语音通话的消息见 calls.rs
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -39,6 +41,16 @@ enum ClientMsg {
     Sync {
         conversation_id: i64,
         after_seq: i64,
+    },
+    CallInvite {
+        call_id: String,
+        conversation_id: i64,
+    },
+    CallAccept {
+        call_id: String,
+    },
+    CallHangup {
+        call_id: String,
     },
 }
 
@@ -63,13 +75,13 @@ enum ServerMsg {
     },
 }
 
-fn reply(tx: &UnboundedSender<String>, msg: &ServerMsg) {
+fn reply(tx: &UnboundedSender<Message>, msg: &ServerMsg) {
     if let Ok(text) = serde_json::to_string(msg) {
-        let _ = tx.send(text);
+        let _ = tx.send(Message::Text(text.into()));
     }
 }
 
-fn send_error(tx: &UnboundedSender<String>, client_id: Option<&str>, error: &str) {
+fn send_error(tx: &UnboundedSender<Message>, client_id: Option<&str>, error: &str) {
     reply(
         tx,
         &ServerMsg::Error {
@@ -86,19 +98,20 @@ pub async fn ws_handler(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, user))
+    ws.max_message_size(64 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state, user))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, user: User) {
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let conn_id = state.hub.register(user.id, tx.clone());
     tracing::info!(user = %user.username, conn_id, "connected");
 
     // 写任务：把 channel 里的消息发到 socket
     let mut send_task = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            if sink.send(Message::Text(text.into())).await.is_err() {
+        while let Some(msg) = rx.recv().await {
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
@@ -108,7 +121,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: User) {
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
-                Some(Ok(Message::Text(text))) => handle_text(&state, &user, &tx, text.as_str()).await,
+                Some(Ok(Message::Text(text))) => handle_text(&state, &user, conn_id, &tx, text.as_str()).await,
+                Some(Ok(Message::Binary(data))) => calls::relay_audio(&state, user.id, conn_id, data),
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 Some(Ok(_)) => {} // ping/pong 由 axum 自动处理
             },
@@ -116,12 +130,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: User) {
         }
     }
 
+    calls::disconnected(&state, user.id, conn_id);
     state.hub.unregister(user.id, conn_id);
     send_task.abort();
     tracing::info!(user = %user.username, conn_id, "disconnected");
 }
 
-async fn handle_text(state: &AppState, user: &User, tx: &UnboundedSender<String>, text: &str) {
+async fn handle_text(
+    state: &AppState,
+    user: &User,
+    conn_id: u64,
+    tx: &UnboundedSender<Message>,
+    text: &str,
+) {
     match serde_json::from_str::<ClientMsg>(text) {
         Ok(ClientMsg::Send {
             client_id,
@@ -132,13 +153,23 @@ async fn handle_text(state: &AppState, user: &User, tx: &UnboundedSender<String>
             conversation_id,
             after_seq,
         }) => handle_sync(state, user, tx, conversation_id, after_seq).await,
+        Ok(ClientMsg::CallInvite {
+            call_id,
+            conversation_id,
+        }) => {
+            if let Err(e) = calls::invite(state, user, conn_id, call_id.clone(), conversation_id).await {
+                send_error(tx, Some(&call_id), &e);
+            }
+        }
+        Ok(ClientMsg::CallAccept { call_id }) => calls::accept(state, user, conn_id, &call_id),
+        Ok(ClientMsg::CallHangup { call_id }) => calls::hangup(state, user, conn_id, &call_id),
         Err(e) => send_error(tx, None, &format!("无法解析消息: {e}")),
     }
 }
 
 async fn ensure_member(
     state: &AppState,
-    tx: &UnboundedSender<String>,
+    tx: &UnboundedSender<Message>,
     conversation_id: i64,
     user_id: i64,
     client_id: Option<&str>,
@@ -160,7 +191,7 @@ async fn ensure_member(
 async fn handle_send(
     state: &AppState,
     user: &User,
-    tx: &UnboundedSender<String>,
+    tx: &UnboundedSender<Message>,
     client_id: String,
     conversation_id: i64,
     body: String,
@@ -204,8 +235,9 @@ async fn handle_send(
     match db::member_ids(&state.db, conversation_id).await {
         Ok(ids) => {
             if let Ok(text) = serde_json::to_string(&ServerMsg::Message { message }) {
+                let msg = Message::Text(text.into());
                 for uid in ids {
-                    state.hub.send_to_user(uid, &text);
+                    state.hub.send_to_user(uid, msg.clone());
                 }
             }
         }
@@ -216,7 +248,7 @@ async fn handle_send(
 async fn handle_sync(
     state: &AppState,
     user: &User,
-    tx: &UnboundedSender<String>,
+    tx: &UnboundedSender<Message>,
     conversation_id: i64,
     after_seq: i64,
 ) {

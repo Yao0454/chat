@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod calls;
 mod db;
 mod error;
 mod hub;
@@ -15,12 +16,13 @@ use axum::{
 use sqlx::SqlitePool;
 use tracing_subscriber::EnvFilter;
 
-use crate::{hub::Hub, ratelimit::RateLimiter};
+use crate::{calls::Calls, hub::Hub, ratelimit::RateLimiter};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
     pub hub: Arc<Hub>,
+    pub calls: Arc<Calls>,
     /// 登录和注册共用：每个 IP 每分钟最多 10 次
     pub auth_limiter: Arc<RateLimiter>,
 }
@@ -29,7 +31,8 @@ pub struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("chat_server=info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("chat_server=info")),
         )
         .init();
 
@@ -57,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         db,
         hub: Arc::new(Hub::default()),
+        calls: Arc::new(Calls::default()),
         auth_limiter: Arc::new(RateLimiter::new(10, Duration::from_secs(60))),
     };
 
@@ -82,11 +86,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 部署时放在 Caddy 后面，所以默认只监听本机
     let addr: SocketAddr = std::env::var("BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");
     // 带上对端地址，限速要用
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

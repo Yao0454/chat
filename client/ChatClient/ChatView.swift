@@ -51,6 +51,24 @@ struct ChatView: View {
             .padding(12)
         }
         .navigationTitle(store.title(for: conversation))
+        .toolbar {
+            if conversation.kind == "direct" {
+                ToolbarItem {
+                    Button {
+                        Task {
+                            await store.call.start(
+                                conversationId: conversation.id,
+                                peerName: store.title(for: conversation)
+                            )
+                        }
+                    } label: {
+                        Label("语音通话", systemImage: "phone")
+                    }
+                    .disabled(store.call.isBusy || !store.isConnected)
+                    .help("语音通话")
+                }
+            }
+        }
         .onAppear { inputFocused = true }
     }
 

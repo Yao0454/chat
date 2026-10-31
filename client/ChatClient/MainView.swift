@@ -49,6 +49,14 @@ struct MainView: View {
                 ContentUnavailableView("选择一个会话", systemImage: "message")
             }
         }
+        .overlay(alignment: .top) {
+            if let call = store.call.current {
+                CallBanner(call: call)
+                    .padding(.top, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: store.call.current?.id)
         .sheet(isPresented: $showingNewChat) {
             NewChatSheet { conversationId in
                 selection = conversationId

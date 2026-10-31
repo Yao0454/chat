@@ -91,6 +91,26 @@ pub async fn is_member(db: &SqlitePool, conversation_id: i64, user_id: i64) -> R
     Ok(row.is_some())
 }
 
+/// 一对一会话里的另一个人；不是一对一会话或者自己不在里面时返回 None
+pub async fn direct_peer(
+    db: &SqlitePool,
+    conversation_id: i64,
+    user_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT other.user_id
+         FROM conversations c
+         JOIN conversation_members me ON me.conversation_id = c.id AND me.user_id = ?
+         JOIN conversation_members other ON other.conversation_id = c.id AND other.user_id != ?
+         WHERE c.id = ? AND c.kind = 'direct'",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await
+}
+
 pub async fn member_ids(db: &SqlitePool, conversation_id: i64) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>("SELECT user_id FROM conversation_members WHERE conversation_id = ?")
         .bind(conversation_id)
