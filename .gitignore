@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Rust 编译产物
+/server/target/
+
+# 本地数据库（里面有邀请码、密码哈希和登录 token，不能提交）
+*.db
+*.db-shm
+*.db-wal
+
+# Xcode 个人设置和编译产物
+xcuserdata/
+DerivedData/
+build/
