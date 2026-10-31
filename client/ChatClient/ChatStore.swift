@@ -16,12 +16,23 @@ final class ChatStore {
     var isConnected = false
     var errorMessage: String?
     let call = CallController()
+    /// 会话 id → 用户 id → 读到哪里
+    var reads: [Int64: [Int64: ReadStateDTO]] = [:]
+    /// 当前打开的会话（侧边栏选中的那个）
+    var activeConversationId: Int64? {
+        didSet {
+            guard activeConversationId != oldValue else { return }
+            markActiveRead()
+            if let id = activeConversationId { notifier.clear(conversationId: id) }
+        }
+    }
 
     @ObservationIgnored private var api: APIClient?
     @ObservationIgnored private var socket: ChatSocket?
     /// 每个会话里"连续收到的最大 seq"，重连后从这里开始增量同步
     @ObservationIgnored private var syncedSeq: [Int64: Int64] = [:]
     @ObservationIgnored private var saveTask: Task<Void, Never>?
+    @ObservationIgnored private let notifier = Notifier()
 
     init() {
         // 退出 App 前把还没写盘的改动存下来
@@ -30,6 +41,19 @@ final class ChatStore {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.saveCacheNow() }
         }
+        // 切回 App 时，正在看的会话算作已读
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.markActiveRead() }
+        }
+        notifier.onOpenConversation = { [weak self] id in self?.activeConversationId = id }
+        call.onIncomingCall = { [weak self] conversationId, caller in
+            if !NSApp.isActive {
+                self?.notifier.notifyIncomingCall(conversationId: conversationId, from: caller)
+            }
+        }
+        call.onRingingStopped = { [weak self] in self?.notifier.removeIncomingCall() }
     }
 
     // MARK: - 登录
@@ -99,7 +123,11 @@ final class ChatStore {
         conversations = []
         items = [:]
         syncedSeq = [:]
+        reads = [:]
+        activeConversationId = nil
         isConnected = false
+        notifier.clearAll()
+        updateBadge()
         phase = .loggedOut
     }
 
@@ -126,6 +154,8 @@ final class ChatStore {
         me = user
         loadCache(serverURL: client.baseURL.absoluteString, userId: user.id)
         phase = .loggedIn
+        notifier.requestAuthorization()
+        updateBadge()
 
         let s = ChatSocket(url: websocketURL(for: client.baseURL), token: client.token ?? "")
         s.onEvent = { [weak self] event in self?.handle(event) }
@@ -147,6 +177,10 @@ final class ChatStore {
         do {
             users = try await api.get("api/users")
             conversations = try await api.get("api/conversations")
+            for conv in conversations {
+                for state in conv.readStates ?? [] { mergeRead(conv.id, state) }
+            }
+            updateBadge()
             for conv in conversations where syncedSeq[conv.id] == nil {
                 requestSync(conv.id)
             }
@@ -172,6 +206,60 @@ final class ChatStore {
             report(error)
             return nil
         }
+    }
+
+    /// 侧边栏顺序：最近有消息的在上面
+    var sortedConversations: [ConversationDTO] {
+        conversations.sorted { (lastActivity($0.id) ?? .distantPast) > (lastActivity($1.id) ?? .distantPast) }
+    }
+
+    func lastActivity(_ conversationId: Int64) -> Date? {
+        items[conversationId]?.last?.createdAt
+    }
+
+    func username(_ userId: Int64) -> String {
+        users.first { $0.id == userId }?.username ?? "对方"
+    }
+
+    // MARK: - 已读
+
+    func readState(_ conversationId: Int64, userId: Int64) -> ReadStateDTO? {
+        reads[conversationId]?[userId]
+    }
+
+    /// 一对一会话里对方的已读状态
+    func peerReadState(_ conv: ConversationDTO) -> ReadStateDTO? {
+        guard let peer = conv.members.first(where: { $0.id != me?.id }) else { return nil }
+        return readState(conv.id, userId: peer.id)
+    }
+
+    /// 别人发来的、我还没读的消息数
+    func unreadCount(_ conversationId: Int64) -> Int {
+        guard let me else { return 0 }
+        let read = readState(conversationId, userId: me.id)?.lastReadSeq ?? 0
+        return items[conversationId]?.count { ($0.seq ?? 0) > read && $0.senderId != me.id } ?? 0
+    }
+
+    /// 只往前推进，不往回退
+    private func mergeRead(_ conversationId: Int64, _ state: ReadStateDTO) {
+        if let old = reads[conversationId]?[state.userId], old.lastReadSeq >= state.lastReadSeq { return }
+        reads[conversationId, default: [:]][state.userId] = state
+    }
+
+    /// 正在看的会话（App 在前台、选中了它）里有新消息时，告诉服务端我读到了最新一条
+    private func markActiveRead(force: Bool = false) {
+        guard let id = activeConversationId, let me, NSApp.isActive,
+              let latest = items[id]?.compactMap(\.seq).max() else { return }
+        let read = readState(id, userId: me.id)?.lastReadSeq ?? 0
+        guard latest > read || force else { return }
+        socket?.send(ReadCommand(conversationId: id, seq: latest))
+        mergeRead(id, ReadStateDTO(userId: me.id, lastReadSeq: latest, lastReadAt: Int64(Date.now.timeIntervalSince1970 * 1000)))
+        updateBadge()
+    }
+
+    private func updateBadge() {
+        let total = conversations.reduce(0) { $0 + unreadCount($1.id) }
+        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
     }
 
     func title(for conv: ConversationDTO) -> String {
@@ -210,6 +298,8 @@ final class ChatStore {
     private func didConnect() {
         // 断线期间可能有新用户注册，或者有人和我开了新会话
         Task { await refreshLists() }
+        // 断线时发的已读可能丢了，再报一次
+        markActiveRead(force: true)
         for conv in conversations {
             requestSync(conv.id)
         }
@@ -228,6 +318,11 @@ final class ChatStore {
                 // 别人刚和我开了新会话
                 Task { await refreshLists() }
             }
+            if case .message = event, m.senderId != me?.id,
+               !(NSApp.isActive && activeConversationId == m.conversationId),
+               !(items[m.conversationId]?.contains { $0.seq == m.seq } ?? false) {
+                notifier.notifyMessage(conversationId: m.conversationId, from: username(m.senderId), body: m.body)
+            }
             upsert(m)
             sortItems(m.conversationId)
             advanceSynced(m.conversationId)
@@ -241,6 +336,9 @@ final class ChatStore {
             sortItems(conversationId)
             advanceSynced(conversationId)
             if hasMore { requestSync(conversationId) }
+
+        case .read(let conversationId, let state):
+            mergeRead(conversationId, state)
 
         case .callIncoming, .callAccepted, .callEnded:
             call.handle(event)
@@ -259,6 +357,8 @@ final class ChatStore {
         case .unknown:
             break
         }
+        markActiveRead()
+        updateBadge()
         scheduleSave()
     }
 
@@ -321,6 +421,7 @@ final class ChatStore {
         conversations = cache.conversations
         items = cache.items
         syncedSeq = cache.syncedSeq
+        reads = cache.reads ?? [:]
     }
 
     /// 改动很频繁（收一页历史就是几百条），攒 1 秒再写一次盘
@@ -342,7 +443,8 @@ final class ChatStore {
             users: users,
             conversations: conversations,
             items: items,
-            syncedSeq: syncedSeq
+            syncedSeq: syncedSeq,
+            reads: reads
         ))
     }
 

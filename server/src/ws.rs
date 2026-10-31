@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::{
     auth::AuthUser,
     calls,
-    db::{self, MessageRow, User},
+    db::{self, MessageRow, ReadState, User},
     AppState,
 };
 
@@ -23,10 +23,12 @@ const SYNC_PAGE: i64 = 200;
 // 客户端 → 服务端
 //   {"type":"send","client_id":"<uuid>","conversation_id":1,"body":"hi"}
 //   {"type":"sync","conversation_id":1,"after_seq":0}
+//   {"type":"read","conversation_id":1,"seq":42}          我读到了第 42 条
 // 服务端 → 客户端
 //   {"type":"ack","client_id":"...","message":{...}}      只发给发送这条消息的连接
 //   {"type":"message","message":{...}}                    发给会话里所有人的所有连接（包括发送者）
 //   {"type":"history","conversation_id":1,"messages":[...],"has_more":false}
+//   {"type":"read","conversation_id":1,"user_id":2,"last_read_seq":42,"last_read_at":...}   发给会话里所有人
 //   {"type":"error","client_id":null,"error":"..."}       client_id 是出错的消息或通话的 id
 // 语音通话的消息见 calls.rs
 
@@ -41,6 +43,10 @@ enum ClientMsg {
     Sync {
         conversation_id: i64,
         after_seq: i64,
+    },
+    Read {
+        conversation_id: i64,
+        seq: i64,
     },
     CallInvite {
         call_id: String,
@@ -68,6 +74,11 @@ enum ServerMsg {
         conversation_id: i64,
         messages: Vec<MessageRow>,
         has_more: bool,
+    },
+    Read {
+        conversation_id: i64,
+        #[serde(flatten)]
+        state: ReadState,
     },
     Error {
         client_id: Option<String>,
@@ -153,6 +164,10 @@ async fn handle_text(
             conversation_id,
             after_seq,
         }) => handle_sync(state, user, tx, conversation_id, after_seq).await,
+        Ok(ClientMsg::Read {
+            conversation_id,
+            seq,
+        }) => handle_read(state, user, tx, conversation_id, seq).await,
         Ok(ClientMsg::CallInvite {
             call_id,
             conversation_id,
@@ -273,5 +288,41 @@ async fn handle_sync(
             tracing::error!("messages_after failed: {e}");
             send_error(tx, None, "同步消息失败");
         }
+    }
+}
+
+async fn handle_read(
+    state: &AppState,
+    user: &User,
+    tx: &UnboundedSender<Message>,
+    conversation_id: i64,
+    seq: i64,
+) {
+    if !ensure_member(state, tx, conversation_id, user.id, None).await {
+        return;
+    }
+    let read = match db::mark_read(&state.db, conversation_id, user.id, seq).await {
+        Ok(Some(read)) => read,
+        Ok(None) => return, // 没有往前推进，不用通知
+        Err(e) => {
+            tracing::error!("mark_read failed: {e}");
+            return;
+        }
+    };
+    // 发给会话里所有人：对方用来显示"已读"，自己的其他设备用来清掉未读
+    match db::member_ids(&state.db, conversation_id).await {
+        Ok(ids) => {
+            let msg = ServerMsg::Read {
+                conversation_id,
+                state: read,
+            };
+            if let Ok(text) = serde_json::to_string(&msg) {
+                let msg = Message::Text(text.into());
+                for uid in ids {
+                    state.hub.send_to_user(uid, msg.clone());
+                }
+            }
+        }
+        Err(e) => tracing::error!("member_ids failed: {e}"),
     }
 }

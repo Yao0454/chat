@@ -94,7 +94,7 @@ private nonisolated final class OneShotInput: @unchecked Sendable {
 }
 
 /// 通话的音频部分：麦克风 → 回声消除 → 重采样到 48kHz → Opus 编码，
-/// 以及 Opus 解码 → 播放。音频回调在系统的音频线程上执行，所以这个类不在主线程上，
+/// 以及 Opus 解码 → 增益 → 限幅 → 播放。音频回调在系统的音频线程上执行，所以这个类不在主线程上，
 /// 跨线程的状态都用锁保护。
 nonisolated final class VoiceEngine: @unchecked Sendable {
     /// 每编码出一帧（20ms）就调用一次，在音频线程上
@@ -108,8 +108,21 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
     /// 是否开启了系统的回声消除。有些设备组合下开不了，这时建议戴耳机
     private(set) var echoCancellation = false
 
+    /// 最近的音量，0...1。界面用来画音量条
+    var levels: (input: Float, output: Float) {
+        lock.withLock { (inputLevel, outputLevel) }
+    }
+
+    /// 麦克风连续 2 秒采到的全是 0（不是安静，是完全没有信号）。
+    /// 通常是系统的麦克风权限已经失效，App 拿到的是被静音的数据
+    var micSilent: Bool {
+        lock.withLock { zeroFrames >= Int(OpusCodec.sampleRate * 2) }
+    }
+
     /// 播放端最多积压这么多采样（300ms）。网络卡顿后数据会一下子涌过来，超出的直接丢掉，免得延迟越来越大
     private static let maxQueuedFrames = AVAudioFrameCount(OpusCodec.sampleRate * 0.3)
+    /// 开了回声消除后系统会压低播放音量，这里补回来；后面有限幅器，不会爆音
+    private static let playbackGainDB: Float = 10
 
     private var engine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
@@ -121,6 +134,9 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
     private var muted = false
     private var running = false
     private var queuedFrames: AVAudioFrameCount = 0
+    private var inputLevel: Float = 0
+    private var outputLevel: Float = 0
+    private var zeroFrames = 0
     private var captureConverter: AVAudioConverter?
     private var pending: [Float] = []   // 攒够一帧再编码
 
@@ -128,9 +144,7 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
         do {
             try startEngine(voiceProcessing: true)
         } catch {
-            // 回声消除会把默认输入、输出设备合成一个设备来用。两者采样率不同
-            // （比如麦克风 48kHz、扬声器 44.1kHz）或者用了虚拟声卡时，可能初始化失败
-            // （错误 -10875）。这时换一个新的引擎，不带回声消除再试一次
+            // 个别设备组合下回声消除仍然可能初始化失败，换一个新的引擎不带回声消除再试一次
             print("开启回声消除后启动失败，改为不带回声消除: \(error)")
             teardown()
             engine = AVAudioEngine()
@@ -140,12 +154,20 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
     }
 
     private func startEngine(voiceProcessing: Bool) throws {
+        // 必须在开启回声消除之前先建好 mainMixer → 输出 的连接。
+        // 反过来的话，输出端初始化会失败（-10875，kAUInitialize on outputNode），
+        // 在麦克风 48kHz、扬声器 44.1kHz 的 MacBook Air 上每次都能复现
+        _ = engine.mainMixerNode
         let input = engine.inputNode
         echoCancellation = false
         if voiceProcessing {
             // 系统自带的回声消除和降噪，开外放也不会把对方的声音再传回去
             do {
                 try input.setVoiceProcessingEnabled(true)
+                input.isVoiceProcessingAGCEnabled = true
+                // 通话时尽量不压低其他 App 的声音
+                input.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
                 echoCancellation = true
             } catch {
                 print("回声消除开启失败，继续通话: \(error)")
@@ -159,8 +181,21 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
         }
         captureConverter = converter
 
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: decoder.pcmFormat)
+        // 播放链路：player → 增益 → 限幅 → mainMixer
+        let gain = AVAudioUnitEQ(numberOfBands: 0)
+        gain.globalGain = Self.playbackGainDB
+        let limiter = AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: kAudioUnitSubType_PeakLimiter,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0, componentFlagsMask: 0
+        ))
+        let format = decoder.pcmFormat
+        for node in [player, gain, limiter] { engine.attach(node) }
+        engine.connect(player, to: gain, format: format)
+        engine.connect(gain, to: limiter, format: format)
+        engine.connect(limiter, to: engine.mainMixerNode, format: format)
+
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.capture(buffer)
         }
@@ -195,7 +230,11 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
             let ok = lock.withLock { running && queuedFrames < Self.maxQueuedFrames }
             guard ok, let buffer = decoder.decode(packet) else { return }
             let frames = buffer.frameLength
-            lock.withLock { queuedFrames += frames }
+            let level = Self.level(buffer.floatChannelData![0], count: Int(frames))
+            lock.withLock {
+                queuedFrames += frames
+                outputLevel = max(level, outputLevel * 0.85)
+            }
             player.scheduleBuffer(buffer) { [weak self] in
                 guard let self else { return }
                 self.lock.withLock { self.queuedFrames -= frames }
@@ -210,9 +249,17 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
         guard let resampled = AVAudioPCMBuffer(pcmFormat: encoder.pcmFormat, frameCapacity: capacity),
               convert(converter, from: buffer, to: resampled),
               let samples = resampled.floatChannelData?[0] else { return }
-        pending.append(contentsOf: UnsafeBufferPointer(start: samples, count: Int(resampled.frameLength)))
+        let count = Int(resampled.frameLength)
+        let level = Self.level(samples, count: count)
+        let allZero = !(0..<count).contains { samples[$0] != 0 }
+        pending.append(contentsOf: UnsafeBufferPointer(start: samples, count: count))
 
-        let muted = isMuted
+        let muted = lock.withLock {
+            inputLevel = self.muted ? 0 : level
+            zeroFrames = allZero ? zeroFrames + count : 0
+            outputLevel *= 0.85   // 对方不说话时让播放音量条慢慢落下
+            return self.muted
+        }
         while pending.count >= OpusCodec.frameSize {
             let frame = Array(pending[..<OpusCodec.frameSize])
             pending.removeFirst(OpusCodec.frameSize)
@@ -221,5 +268,15 @@ nonisolated final class VoiceEngine: @unchecked Sendable {
                 onPacket?(packet)
             }
         }
+    }
+
+    /// 均方根音量换算成 0...1：-50 dB 以下算 0，0 dB 算 1
+    private static func level(_ samples: UnsafePointer<Float>, count: Int) -> Float {
+        guard count > 0 else { return 0 }
+        var sum: Float = 0
+        for i in 0..<count { sum += samples[i] * samples[i] }
+        let rms = (sum / Float(count)).squareRoot()
+        let db = 20 * log10(max(rms, 1e-6))
+        return min(max((db + 50) / 50, 0), 1)
     }
 }

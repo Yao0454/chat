@@ -18,6 +18,19 @@ struct ConversationDTO: Codable, Identifiable, Hashable {
     let title: String?
     let lastSeq: Int64
     let members: [UserDTO]
+    /// 旧版服务端和旧的本地缓存里没有这个字段
+    let readStates: [ReadStateDTO]?
+}
+
+/// 某个成员在某个会话里读到了第几条
+struct ReadStateDTO: Codable, Hashable {
+    let userId: Int64
+    let lastReadSeq: Int64
+    let lastReadAt: Int64? // 毫秒时间戳
+
+    var readAt: Date? {
+        lastReadAt.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+    }
 }
 
 struct MessageDTO: Codable, Hashable {
@@ -62,6 +75,13 @@ struct SyncCommand: Encodable {
     let afterSeq: Int64
 }
 
+/// 我读到了第 seq 条
+struct ReadCommand: Encodable {
+    let type = "read"
+    let conversationId: Int64
+    let seq: Int64
+}
+
 /// 语音通话：发起
 struct CallInviteCommand: Encodable {
     let type = "call_invite"
@@ -80,6 +100,7 @@ enum ServerEvent: Decodable {
     case message(MessageDTO)
     case history(conversationId: Int64, messages: [MessageDTO], hasMore: Bool)
     case error(clientId: String?, error: String)
+    case read(conversationId: Int64, state: ReadStateDTO)
     case callIncoming(callId: String, conversationId: Int64, from: UserDTO)
     case callAccepted(callId: String)
     case callEnded(callId: String, reason: String)
@@ -87,6 +108,7 @@ enum ServerEvent: Decodable {
 
     private enum CodingKeys: String, CodingKey {
         case type, clientId, message, conversationId, messages, hasMore, error, callId, from, reason
+        case userId, lastReadSeq, lastReadAt
     }
 
     init(from decoder: Decoder) throws {
@@ -109,6 +131,15 @@ enum ServerEvent: Decodable {
             self = .error(
                 clientId: try c.decodeIfPresent(String.self, forKey: .clientId),
                 error: try c.decode(String.self, forKey: .error)
+            )
+        case "read":
+            self = .read(
+                conversationId: try c.decode(Int64.self, forKey: .conversationId),
+                state: ReadStateDTO(
+                    userId: try c.decode(Int64.self, forKey: .userId),
+                    lastReadSeq: try c.decode(Int64.self, forKey: .lastReadSeq),
+                    lastReadAt: try c.decodeIfPresent(Int64.self, forKey: .lastReadAt)
+                )
             )
         case "call_incoming":
             self = .callIncoming(

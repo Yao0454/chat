@@ -16,8 +16,16 @@ struct LoginView: View {
         @Bindable var store = store
 
         VStack(spacing: 16) {
+            Image(systemName: "bubble.left.and.bubble.right.fill")
+                .font(.system(size: 44))
+                .foregroundStyle(Palette.bubbleBlue)
+                .frame(width: 88, height: 88)
+                .glass(in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .padding(.bottom, 4)
+
             Text(isRegister ? "用邀请码注册" : "登录")
                 .font(.largeTitle.bold())
+                .contentTransition(.opacity)
 
             Form {
                 TextField("服务器地址", text: $store.serverURLString)
@@ -55,7 +63,9 @@ struct LoginView: View {
             .disabled(!canSubmit)
 
             Button(isRegister ? "已有账号，去登录" : "有邀请码？注册新账号") {
-                isRegister.toggle()
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    isRegister.toggle()
+                }
                 store.errorMessage = nil
             }
             .buttonStyle(.link)

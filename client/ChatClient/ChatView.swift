@@ -13,42 +13,39 @@ struct ChatView: View {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// 我发的最后一条，下面显示"已送达 / 已读"
+    private var lastMineId: String? {
+        items.last { $0.senderId == store.me?.id }?.id
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 6) {
-                        ForEach(items) { item in
-                            MessageBubble(
-                                item: item,
-                                isMine: item.senderId == store.me?.id,
-                                onRetry: { store.retry(item, in: conversation.id) }
-                            )
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        row(at: index, item)
                             .id(item.id)
-                        }
+                            .transition(.asymmetric(
+                                insertion: .scale(scale: 0.6, anchor: item.senderId == store.me?.id ? .bottomTrailing : .bottomLeading)
+                                    .combined(with: .opacity),
+                                removal: .opacity
+                            ))
                     }
-                    .padding(12)
                 }
-                .onAppear { scrollToBottom(proxy, animated: false) }
-                .onChange(of: items.count) { scrollToBottom(proxy, animated: true) }
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 6)
+                .animation(.spring(response: 0.38, dampingFraction: 0.78), value: items.count)
+                .animation(.easeOut(duration: 0.25), value: store.peerReadState(conversation)?.lastReadSeq)
             }
-
-            Divider()
-
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("输入消息，回车发送", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...5)
-                    .focused($inputFocused)
-                    .onSubmit(send)
-                Button(action: send) {
-                    Image(systemName: "paperplane.fill")
+            .defaultScrollAnchor(.bottom)
+            .onChange(of: items.last?.id) {
+                guard let last = items.last else { return }
+                withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) {
+                    proxy.scrollTo(last.id, anchor: .bottom)
                 }
-                .buttonStyle(.borderless)
-                .disabled(!canSend)
-                .help("发送")
             }
-            .padding(12)
+            .safeAreaInset(edge: .bottom) { inputBar }
         }
         .navigationTitle(store.title(for: conversation))
         .toolbar {
@@ -62,7 +59,7 @@ struct ChatView: View {
                             )
                         }
                     } label: {
-                        Label("语音通话", systemImage: "phone")
+                        Label("语音通话", systemImage: "phone.fill")
                     }
                     .disabled(store.call.isBusy || !store.isConnected)
                     .help("语音通话")
@@ -72,68 +69,110 @@ struct ChatView: View {
         .onAppear { inputFocused = true }
     }
 
+    // MARK: - 一行
+
+    @ViewBuilder
+    private func row(at index: Int, _ item: ChatItem) -> some View {
+        let previous = index > 0 ? items[index - 1] : nil
+        let next = index + 1 < items.count ? items[index + 1] : nil
+        let showTime = previous.map { item.createdAt.timeIntervalSince($0.createdAt) > 10 * 60 } ?? true
+        let joinsPrevious = !showTime && previous.map { Self.sameGroup($0, item) } == true
+        let joinsNext = next.map { Self.sameGroup(item, $0) && $0.createdAt.timeIntervalSince(item.createdAt) <= 10 * 60 } ?? false
+        let isMine = item.senderId == store.me?.id
+
+        VStack(spacing: 0) {
+            if showTime {
+                Text(ChatTime.separator(item.createdAt))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, index == 0 ? 0 : 14)
+                    .padding(.bottom, 8)
+            }
+            MessageBubble(item: item, isMine: isMine, hasTail: !joinsNext) {
+                store.retry(item, in: conversation.id)
+            }
+            .padding(.top, showTime ? 0 : (joinsPrevious ? 2 : 10))
+
+            if item.id == lastMineId {
+                receipt(for: item)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.trailing, 8)
+                    .padding(.top, 3)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    /// 同一个人、一分钟内连着发的算一组：间距更小，只有最后一条带尾巴
+    private static func sameGroup(_ a: ChatItem, _ b: ChatItem) -> Bool {
+        a.senderId == b.senderId && b.createdAt.timeIntervalSince(a.createdAt) < 60
+    }
+
+    @ViewBuilder
+    private func receipt(for item: ChatItem) -> some View {
+        Group {
+            switch item.status {
+            case .pending:
+                Text("发送中…")
+            case .failed:
+                Text("未送达").foregroundStyle(.red)
+            case .sent:
+                if let read = store.peerReadState(conversation), let seq = item.seq, read.lastReadSeq >= seq {
+                    if let at = read.readAt {
+                        Text("已读 ").fontWeight(.semibold) + Text(at.formatted(date: .omitted, time: .shortened))
+                    } else {
+                        Text("已读").fontWeight(.semibold)
+                    }
+                } else {
+                    Text("已送达")
+                }
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .contentTransition(.opacity)
+    }
+
+    // MARK: - 输入框
+
+    private var inputBar: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField("iMessage", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 14))
+                .lineLimit(1...6)
+                .focused($inputFocused)
+                .onSubmit(send)
+                .padding(.vertical, 2)
+
+            if canSend {
+                Button(action: send) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 26, height: 26)
+                        .background(Palette.bubbleBlue, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: .command)
+                .help("发送")
+                .transition(.scale(scale: 0.4).combined(with: .opacity))
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, canSend ? 5 : 14)
+        .padding(.vertical, 5)
+        .frame(minHeight: 36)
+        .glass(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, 14)
+        .padding(.bottom, 12)
+        .padding(.top, 4)
+        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: canSend)
+    }
+
     private func send() {
         guard canSend else { return }
         store.send(draft, to: conversation.id)
         draft = ""
-    }
-
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
-        guard let last = items.last else { return }
-        if animated {
-            withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(last.id, anchor: .bottom) }
-        } else {
-            proxy.scrollTo(last.id, anchor: .bottom)
-        }
-    }
-}
-
-struct MessageBubble: View {
-    let item: ChatItem
-    let isMine: Bool
-    var onRetry: () -> Void
-
-    var body: some View {
-        HStack(alignment: .bottom, spacing: 6) {
-            if isMine {
-                Spacer(minLength: 60)
-                statusIcon
-            }
-
-            Text(item.body)
-                .textSelection(.enabled)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    isMine ? Color.accentColor : Color.secondary.opacity(0.15),
-                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                )
-                .foregroundStyle(isMine ? Color.white : Color.primary)
-                .help(item.createdAt.formatted(date: .abbreviated, time: .shortened))
-
-            if !isMine {
-                Spacer(minLength: 60)
-            }
-        }
-        .opacity(item.status == .pending ? 0.6 : 1)
-    }
-
-    @ViewBuilder
-    private var statusIcon: some View {
-        switch item.status {
-        case .pending:
-            Image(systemName: "clock")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        case .failed(let reason):
-            Button(action: onRetry) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .foregroundStyle(.red)
-            }
-            .buttonStyle(.borderless)
-            .help("发送失败：\(reason)。点击重新发送")
-        case .sent:
-            EmptyView()
-        }
     }
 }

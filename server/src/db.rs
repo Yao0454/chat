@@ -73,6 +73,15 @@ pub struct Conversation {
     pub title: Option<String>,
     pub last_seq: i64,
     pub members: Vec<User>,
+    pub read_states: Vec<ReadState>,
+}
+
+/// 某个成员读到了哪条消息
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadState {
+    pub user_id: i64,
+    pub last_read_seq: i64,
+    pub last_read_at: Option<i64>,
 }
 
 const MESSAGE_COLUMNS: &str =
@@ -131,6 +140,8 @@ pub async fn conversations_for_user(db: &SqlitePool, user_id: i64) -> Result<Vec
         conversation_id: i64,
         id: i64,
         username: String,
+        last_read_seq: i64,
+        last_read_at: Option<i64>,
     }
 
     let convs = sqlx::query_as::<_, ConvRow>(
@@ -145,7 +156,7 @@ pub async fn conversations_for_user(db: &SqlitePool, user_id: i64) -> Result<Vec
     .await?;
 
     let members = sqlx::query_as::<_, MemberRow>(
-        "SELECT m.conversation_id, u.id, u.username
+        "SELECT m.conversation_id, u.id, u.username, m.last_read_seq, m.last_read_at
          FROM conversation_members m
          JOIN users u ON u.id = m.user_id
          WHERE m.conversation_id IN
@@ -156,9 +167,15 @@ pub async fn conversations_for_user(db: &SqlitePool, user_id: i64) -> Result<Vec
     .fetch_all(db)
     .await?;
 
-    let mut by_conv: HashMap<i64, Vec<User>> = HashMap::new();
+    let mut by_conv: HashMap<i64, (Vec<User>, Vec<ReadState>)> = HashMap::new();
     for m in members {
-        by_conv.entry(m.conversation_id).or_default().push(User {
+        let (users, reads) = by_conv.entry(m.conversation_id).or_default();
+        reads.push(ReadState {
+            user_id: m.id,
+            last_read_seq: m.last_read_seq,
+            last_read_at: m.last_read_at,
+        });
+        users.push(User {
             id: m.id,
             username: m.username,
         });
@@ -166,14 +183,48 @@ pub async fn conversations_for_user(db: &SqlitePool, user_id: i64) -> Result<Vec
 
     Ok(convs
         .into_iter()
-        .map(|c| Conversation {
-            members: by_conv.remove(&c.id).unwrap_or_default(),
+        .map(|c| {
+            let (members, read_states) = by_conv.remove(&c.id).unwrap_or_default();
+            Conversation {
+                members,
+                read_states,
             id: c.id,
-            kind: c.kind,
-            title: c.title,
-            last_seq: c.last_seq,
+                kind: c.kind,
+                title: c.title,
+                last_seq: c.last_seq,
+            }
         })
         .collect())
+}
+
+/// 记录 user 读到了 seq（不会往回退，也不会超过会话里最后一条）。
+/// 真的往前推进了才返回新的状态，用来决定要不要通知其他人
+pub async fn mark_read(
+    db: &SqlitePool,
+    conversation_id: i64,
+    user_id: i64,
+    seq: i64,
+) -> Result<Option<ReadState>, sqlx::Error> {
+    let now = now_ms();
+    let updated = sqlx::query_scalar::<_, i64>(
+        "UPDATE conversation_members
+         SET last_read_seq = MIN(?1, (SELECT last_seq FROM conversations WHERE id = ?2)),
+             last_read_at = ?3
+         WHERE conversation_id = ?2 AND user_id = ?4
+           AND last_read_seq < MIN(?1, (SELECT last_seq FROM conversations WHERE id = ?2))
+         RETURNING last_read_seq",
+    )
+    .bind(seq)
+    .bind(conversation_id)
+    .bind(now)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(updated.map(|last_read_seq| ReadState {
+        user_id,
+        last_read_seq,
+        last_read_at: Some(now),
+    }))
 }
 
 /// 找到或创建两个人之间的一对一会话，返回会话 id

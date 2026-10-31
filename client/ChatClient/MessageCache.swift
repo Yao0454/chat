@@ -9,6 +9,8 @@ struct CacheSnapshot: Codable {
     var conversations: [ConversationDTO]
     var items: [Int64: [ChatItem]]
     var syncedSeq: [Int64: Int64]
+    /// 会话 id → 用户 id → 读到哪里。旧缓存里没有
+    var reads: [Int64: [Int64: ReadStateDTO]]?
 }
 
 /// 同一时间只有一个登录账号，所以只存一个文件；换账号或退出登录时删掉
